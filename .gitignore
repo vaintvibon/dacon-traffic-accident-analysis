@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dataset
+data/
+dataset/
+datasets/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+
+# Training outputs
+checkpoints/
+outputs/
+runs/
+logs/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Submission
+*.zip
+
+# 빈 model 폴더 유지
+!model/
+!model/**/
+!model/**/.gitkeep
