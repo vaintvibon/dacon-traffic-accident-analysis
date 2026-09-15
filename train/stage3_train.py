@@ -6,7 +6,7 @@ from torch import nn
 from torchvision.models import resnet18, ResNet18_Weights
 from torchvision.models.video import mvit_v2_s
 
-from models.stage1_model import Stage1MViT
+from models.stage3_model import Stage3MViT
 
 
 ROOT=Path.cwd(); DATA=ROOT/'data'; MODEL=ROOT/'model'
@@ -46,20 +46,23 @@ def _clip(path,n=16,center=None):
     return x,total
 
 
-def fit_stage1():
-    out=MODEL/'stage1'; out.mkdir(parents=True,exist_ok=True)
-    df=pd.read_csv(DATA/'stage1/labels.csv')
-    model=Stage1MViT().to(DEVICE); opt=torch.optim.AdamW(model.parameters(),1e-4)
+def fit_stage3():
+    out=MODEL/'stage3'; out.mkdir(parents=True,exist_ok=True)
+    df=pd.read_csv(DATA/'stage3/labels.csv')
+    amap={'ACCELERATING':0,'DECELERATING':1,'CONSTANT':2,'STOPPED':3}
+    smap={'LEFT':0,'STRAIGHT':1,'RIGHT':2}
+    model=Stage3MViT().to(DEVICE); opt=torch.optim.AdamW(model.parameters(),1e-4)
     for _ in range(EPOCHS):
         model.train()
-        for r in df.sample(frac=1,random_state=20260825).itertuples():
-            x,_=_clip(DATA/'stage1'/r.path,16); x=(x-S1_MEAN)/S1_STD
-            y=torch.tensor([0 if r.label=='ORIGINAL' else 1],device=DEVICE)
-            loss=nn.functional.cross_entropy(model(x[None].to(DEVICE)),y)
+        for r in df.itertuples():
+            x,_=_clip(DATA/'stage3/videos'/f'{r.ID}.mp4',16,int(r.frame_index))
+            x=(x-S3_MEAN[:,None,:,:])/S3_STD[:,None,:,:]
+            a,s=model(x[None].to(DEVICE))
+            loss=nn.functional.cross_entropy(a,torch.tensor([amap[r.accel_label]],device=DEVICE))
+            loss+=nn.functional.cross_entropy(s,torch.tensor([smap[r.steer_label]],device=DEVICE))
             opt.zero_grad(); loss.backward(); opt.step()
-    # 실제 inference.py는 래퍼가 아닌 mvit_v2_s 본체에 직접 로드한다.
-    torch.save({'model':model.net.state_dict(),'size':224,'frames':16},out/'best.pt')
+    torch.save({'model':model.state_dict()},out/'best.pt')
 
 
 print('device:',DEVICE)
-fit_stage1(); print('Stage 1 완료')
+fit_stage3(); print('Stage 3 완료')
