@@ -2,6 +2,7 @@
 
 Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
+S1_PRECISION=fp32 (default) or bf16 on a supporting CUDA GPU. No FP16.
 Colab: S1_DATASET=vdmoire, S1_DATA_DIR=<extracted root>, S1_MODEL_DIR=<Drive run>.
 S1_RESUME=1 restores last.pt; EPOCHS is the total target, not extra epochs.
 labels.csv may supply source_id/group_id to group all derivatives of an
@@ -29,6 +30,29 @@ from models.stage1_model import Stage1CNNViT, focal_loss, load_stage1_video, sam
 DATA = ROOT / 'data' / 'stage1'
 MODEL = ROOT / 'model' / 'stage1'
 LABELS = {'ORIGINAL': 0, 'RERECORDED': 1}
+
+
+def precision_mode(device):
+    mode = os.getenv('S1_PRECISION', 'fp32').lower()
+    if mode not in ('fp32', 'bf16'):
+        raise ValueError('S1_PRECISION must be fp32 or bf16; FP16 is disabled for stability.')
+    if mode == 'bf16' and (device.type != 'cuda' or not torch.cuda.is_bf16_supported()):
+        raise ValueError('This device does not support CUDA BF16; use S1_PRECISION=fp32.')
+    return mode
+
+
+def clip_training_gradients(model, sample_path):
+    # Do not hide a genuine NaN/Inf or allow it to reach the optimizer.
+    try:
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+    except RuntimeError as error:
+        bad = [name for name, parameter in model.named_parameters()
+               if parameter.grad is not None and not torch.isfinite(parameter.grad).all()]
+        raise FloatingPointError(
+            f'Nonfinite gradient/norm for sample {sample_path}; '
+            f'parameters={bad[:8] or "finite elements but norm overflow"}. '
+            'No optimizer update was applied. Use S1_PRECISION=fp32.'
+        ) from error
 
 
 
@@ -161,12 +185,13 @@ def classification_metrics(labels, probabilities, threshold=.5):
 
 
 @torch.inference_mode()
-def validate(model, df, device, frames=16, frame_batch=16):
+def validate(model, df, device, frames=16, frame_batch=16, precision='fp32'):
     model.eval()
     labels, probabilities = [], []
     for row in df.itertuples():
         clip = load_row(row, model.config['size'], frames)
-        with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                            enabled=precision == 'bf16'):
             probability = model.video_probability(clip[None].to(device), frame_batch)[0, 1]
         labels.append(LABELS[row.label])
         probabilities.append(float(probability))
@@ -189,6 +214,7 @@ def fit_stage1():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    precision = precision_mode(device)
     cv_threads = int(os.getenv('S1_TORCH_THREADS', '4'))
     torch.set_num_threads(max(1, cv_threads))
     if os.getenv('S1_DATASET', 'videos') == 'vdmoire':
@@ -210,13 +236,16 @@ def fit_stage1():
     model = Stage1CNNViT().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(os.getenv('S1_LR', '0.00002')),
                                  weight_decay=.0001)
-    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    # FP32/BF16 do not need FP16 loss scaling. Keep the disabled scaler for the
+    # existing checkpoint structure, without multiplying gradients by 65536.
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
     frames, threshold = 16, .5
     rng = np.random.default_rng(seed)
     split = {'train': train['path'].tolist(), 'validation': val['path'].tolist(),
              'train_groups': sorted(train['_group'].unique().tolist()),
              'validation_groups': sorted(val['_group'].unique().tolist())}
-    print(f'device={device}; train={len(train)}; validation={len(val)}; source groups split')
+    print(f'device={device}; precision={precision}; train={len(train)}; '
+          f'validation={len(val)}; source groups split')
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
     split['official_test'] = held_out['path'].tolist() if len(held_out) else []
     # Relative names and byte sizes detect changed indexing without depending on mount location.
@@ -228,11 +257,17 @@ def fit_stage1():
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     history, start_epoch = [], 1
     settings = dict(seed=seed, frames=frames, frame_batch=frame_batch,
-                    config=model.config, dataset_fingerprint=fingerprint)
+                    config=model.config, dataset_fingerprint=fingerprint, precision=precision)
     if resume:
         saved = torch.load(MODEL / 'last.pt', map_location='cpu', weights_only=False)
-        if saved['settings'] != settings or saved['split'] != split:
+        previous_settings = dict(saved['settings'])
+        previous_precision = previous_settings.pop('precision', 'legacy_fp16')
+        comparable_settings = {k: v for k, v in settings.items() if k != 'precision'}
+        if previous_settings != comparable_settings or saved['split'] != split:
             raise ValueError('Resume data split/config differs from the saved run.')
+        if previous_precision != precision:
+            print(f'Resuming with precision change: {previous_precision} -> {precision}; '
+                  'optimizer state is retained, FP16 scaler state is discarded.')
         model.load_state_dict(saved['model'])
         optimizer.load_state_dict(saved['optimizer'])
         scaler.load_state_dict(saved['scaler'])
@@ -261,18 +296,19 @@ def fit_stage1():
             # Accumulate the mean frame focal loss with one update per video.
             for part in x.split(frame_batch):
                 y = torch.full((len(part),), LABELS[row.label], dtype=torch.long, device=device)
-                with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=precision == 'bf16'):
                     loss = focal_loss(model(part), y) * (len(part) / frames)
                 if not torch.isfinite(loss):
-                    raise FloatingPointError('nonfinite training loss')
+                    raise FloatingPointError(f'Nonfinite training loss for {row.path}')
                 scaler.scale(loss).backward()
                 video_loss += float(loss.detach())
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            clip_training_gradients(model, row.path)
             scaler.step(optimizer)
             scaler.update()
             train_loss += video_loss
-        metrics = validate(model, val, device, frames, frame_batch)
+        metrics = validate(model, val, device, frames, frame_batch, precision)
         record = dict(epoch=epoch, train_focal_loss=train_loss / len(train), **metrics)
         history.append(record)
         improved = (metrics['macro_f1'] > best_f1 or
