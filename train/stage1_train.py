@@ -4,9 +4,16 @@ Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
 S1_MODE=diagnose_bn evaluates a checkpoint copy and writes only bn_diagnostics.json.
 Training uses S1_VIDEO_BATCH=4 (or 2), interleaved across frame microbatches.
+Each video supplies 16 global frames + 3 consecutive clips of 16 frames.
+Global frames receive half the loss weight; the three clips share the other half.
 S1_PRECISION=fp32 (default) or bf16 on a supporting CUDA GPU. No FP16.
 Colab: S1_DATASET=vdmoire, S1_DATA_DIR=<extracted root>, S1_MODEL_DIR=<Drive run>.
 S1_RESUME=1 restores last.pt; EPOCHS is the total target, not extra epochs.
+Stable training: GroupNorm, AdamW, step-wise warmup/cosine decay, FP32 evaluation.
+S1_LR=0.00001, S1_MIN_LR=0.000001, S1_WARMUP_EPOCHS=3 by default.
+Use a NEW run folder; legacy training resumes are intentionally rejected.
+Resume must keep EPOCHS and scheduler settings unchanged. final.pt contains the
+last completed epoch in inference format; best.pt remains validation-selected.
 labels.csv may supply source_id/group_id to group all derivatives of an
 original. Otherwise matching filename stems are treated as one source,
 as in the supplied original/000001 and rerecorded/000001 examples.
@@ -15,6 +22,7 @@ from pathlib import Path
 import json
 import re
 import hashlib
+import math
 import cv2
 import os
 import random
@@ -28,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if __package__ in (None, ''):
     sys.path.insert(0, str(ROOT))
 from models.stage1_model import Stage1CNNViT, focal_loss, load_stage1_video, sample_frame_ids
+from models.stage1_model import HYBRID_SAMPLING, frame_weights
 
 DATA = ROOT / 'data' / 'stage1'
 MODEL = ROOT / 'model' / 'stage1'
@@ -109,20 +118,25 @@ def index_vdmoire(root):
     return train.reset_index(drop=True), test.reset_index(drop=True)
 
 
-def load_row(row, size, frames=16, rng=None):
+def load_row(row, size, frames=16, rng=None, sampling='temporal_bins_center'):
     paths = getattr(row, 'frame_paths', None)
     if paths is None:
-        return load_stage1_video(DATA / row.path, size, frames, rng)
-    ids = sample_frame_ids(len(paths), frames, rng)
+        return load_stage1_video(DATA / row.path, size, frames, rng, sampling)
+    ids = sample_frame_ids(len(paths), frames, rng, sampling)
     images = []
+    decoded = {}
     for index in ids:
+        if int(index) in decoded:
+            images.append(decoded[int(index)])
+            continue
         path = DATA / paths[int(index)]
         bgr = cv2.imread(str(path))
         if bgr is None:
             raise ValueError(f'Cannot decode frame: {path}')
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         x = torch.from_numpy(rgb.copy()).permute(2, 0, 1).float().div_(255)
-        images.append(torch.nn.functional.adaptive_avg_pool2d(x, (size, size)))
+        decoded[int(index)] = torch.nn.functional.adaptive_avg_pool2d(x, (size, size))
+        images.append(decoded[int(index)])
     return torch.stack(images, dim=1)
 
 
@@ -130,6 +144,29 @@ def atomic_torch_save(value, path):
     temporary = path.with_suffix('.tmp')
     torch.save(value, temporary)
     os.replace(temporary, path)
+
+
+def learning_rate_at(step, total_steps, warmup_steps, peak_lr, min_lr):
+    """Zero-based optimizer step; resume uses the same absolute schedule."""
+    if not 0 <= step < total_steps or not 0 <= warmup_steps < total_steps:
+        raise ValueError('Invalid learning-rate schedule step or warmup length')
+    if not 0 < min_lr <= peak_lr:
+        raise ValueError('Require 0 < S1_MIN_LR <= S1_LR')
+    if step < warmup_steps:
+        return peak_lr * (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps - 1)
+    return min_lr + .5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def recent_stability(history, window=5):
+    """Describe recent validation behavior, without claiming convergence."""
+    recent = history[-window:]
+    values = np.array([r['macro_f1'] for r in recent])
+    return dict(window=len(recent), macro_f1_mean=float(values.mean()),
+                macro_f1_std=float(values.std()), macro_f1_min=float(values.min()),
+                macro_f1_max=float(values.max()),
+                min_class_recall=float(min(min(r['recall_original'], r['recall_rerecorded'])
+                                           for r in recent)))
 
 
 def split_by_source(df, val_ratio=.2, seed=20260825):
@@ -183,20 +220,22 @@ def classification_metrics(labels, probabilities, threshold=.5):
     loss = -(labels * np.log(p) + (1 - labels) * np.log(1 - p)).mean()
     return dict(macro_f1=float(f1.mean()), accuracy=float((labels == predictions).mean()),
                 loss=float(loss), recall_original=float(recall[0]),
-                recall_rerecorded=float(recall[1]), confusion_matrix=matrix.tolist())
+                recall_rerecorded=float(recall[1]), confusion_matrix=matrix.tolist(),
+                predicted_rerecorded_fraction=float(predictions.mean()))
 
 
 @torch.inference_mode()
-def validate(model, df, device, frames=16, frame_batch=16, precision='fp32'):
+def validate(model, df, device, frames=16, frame_batch=16, precision='fp32',
+             sampling='temporal_bins_center'):
     model.eval()
     labels, probabilities = [], []
     for number, row in enumerate(df.itertuples(), 1):
         if number == 1 or number % 50 == 0:
             print(f'Evaluating {number}/{len(df)} videos', flush=True)
-        clip = load_row(row, model.config['size'], frames)
+        clip = load_row(row, model.config['size'], frames, sampling=sampling)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=precision == 'bf16'):
-            probability = model.video_probability(clip[None].to(device), frame_batch)[0, 1]
+            probability = model.video_probability(clip[None].to(device), frame_batch, sampling)[0, 1]
         labels.append(LABELS[row.label])
         probabilities.append(float(probability))
     return classification_metrics(labels, probabilities)
@@ -218,16 +257,19 @@ def balanced_video_batches(df, videos, rng):
         yield interleaved[start:start + videos]
 
 
-def mixed_frame_batches(df, indices, size, frames, frame_batch, rng=None):
+def mixed_frame_batches(df, indices, size, frames, frame_batch, rng=None,
+                        sampling='temporal_bins_center'):
     """Every forward contains both classes and multiple videos, even when chunked."""
-    clips = [load_row(df.iloc[int(i)], size, frames, rng) for i in indices]
+    clips = [load_row(df.iloc[int(i)], size, frames, rng, sampling) for i in indices]
     # [video,C,T,H,W] -> [T,video,C,H,W]: never split into single-video forwards.
     x = torch.stack(clips).permute(2, 0, 1, 3, 4).flatten(0, 1)
     labels = torch.tensor([LABELS[df.iloc[int(i)].label] for i in indices])
-    y = labels.repeat(frames)
+    weights = frame_weights(frames, sampling)
+    y = labels.repeat(len(weights))
+    weights = weights.repeat_interleave(len(indices)) / len(indices)
     if frame_batch % len(indices):
         raise ValueError('S1_FRAME_BATCH must be divisible by the actual video batch size')
-    yield from zip(x.split(frame_batch), y.split(frame_batch))
+    yield from zip(x.split(frame_batch), y.split(frame_batch), weights.split(frame_batch))
 
 
 @torch.inference_mode()
@@ -258,7 +300,7 @@ def recalibrate_bn(model, train, device, frames, frame_batch, videos):
         try:
             for step, indices in enumerate(balanced_video_batches(
                     train, videos, np.random.default_rng(0)), 1):
-                for x, _ in mixed_frame_batches(train, indices, model.config['size'],
+                for x, _, _ in mixed_frame_batches(train, indices, model.config['size'],
                                                 frames, frame_batch):
                     model(x.to(device))
                 if step % 25 == 0:
@@ -298,6 +340,8 @@ def diagnose_bn(df, held_out, device, frame_batch, videos):
             raise ValueError('Official test source leakage')
     model = Stage1CNNViT(**checkpoint['config']).to(device)
     model.load_state_dict(checkpoint['model'])
+    if not any(isinstance(m, torch.nn.BatchNorm2d) for m in model.modules()):
+        raise ValueError('This model uses no BatchNorm; BN calibration does not apply.')
     frames = int(checkpoint['frames'])
     print(f'BN diagnosis: epoch={checkpoint["epoch"]}; train={len(train)}; val={len(val)}')
     report = dict(checkpoint=str(checkpoint_path), epoch=checkpoint['epoch'],
@@ -362,22 +406,38 @@ def fit_stage1():
             if not (DATA / path).is_file():
                 raise FileNotFoundError(DATA / path)
     MODEL.mkdir(parents=True, exist_ok=True)
-    if not resume and any((MODEL / name).exists() for name in ('best.pt', 'last.pt')):
+    if not resume and any((MODEL / name).exists() for name in ('best.pt', 'last.pt', 'final.pt')):
         raise ValueError('Output contains checkpoints: use S1_RESUME=1 or a new S1_MODEL_DIR.')
     cv2.setNumThreads(1)
-    model = Stage1CNNViT().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(os.getenv('S1_LR', '0.00002')),
-                                 weight_decay=.0001)
+    model = Stage1CNNViT(norm='group').to(device)
+    peak_lr = float(os.getenv('S1_LR', '0.00001'))
+    min_lr = float(os.getenv('S1_MIN_LR', str(peak_lr * .1)))
+    warmup_epochs = int(os.getenv('S1_WARMUP_EPOCHS', str(min(3, epochs - 1))))
+    if not 0 <= warmup_epochs < epochs or not 0 < min_lr <= peak_lr:
+        raise ValueError('Require 0 <= warmup epochs < EPOCHS and 0 < min LR <= peak LR.')
+    steps_per_epoch = math.ceil(2 * int(train.label.value_counts().max()) / videos)
+    total_steps, warmup_steps = epochs * steps_per_epoch, warmup_epochs * steps_per_epoch
+    # Decoupled decay only on matrix/kernel weights, not norm scales or biases.
+    decay, no_decay = [], []
+    for name, parameter in model.named_parameters():
+        (decay if parameter.ndim >= 2 and name.endswith('weight') else no_decay).append(parameter)
+    optimizer = torch.optim.AdamW([{'params': decay, 'weight_decay': .0001},
+                                   {'params': no_decay, 'weight_decay': 0.}], lr=peak_lr)
     # FP32/BF16 do not need FP16 loss scaling. Keep the disabled scaler for the
     # existing checkpoint structure, without multiplying gradients by 65536.
     scaler = torch.amp.GradScaler('cuda', enabled=False)
     frames, threshold = 16, .5
+    sampling = HYBRID_SAMPLING
     rng = np.random.default_rng(seed)
     split = {'train': train['path'].tolist(), 'validation': val['path'].tolist(),
              'train_groups': sorted(train['_group'].unique().tolist()),
              'validation_groups': sorted(val['_group'].unique().tolist())}
     print(f'device={device}; precision={precision}; train={len(train)}; '
           f'validation={len(val)}; source groups split')
+    print(f'norm=group; optimizer=AdamW; lr={peak_lr:g}->{min_lr:g}; '
+          f'warmup={warmup_epochs} epochs; validation=fp32', flush=True)
+    print('Sampling: global 16 + three continuous 16-frame clips; '
+          'weights=50% global / 50% clips; randomized train centers, fixed eval centers.', flush=True)
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
     split['official_test'] = held_out['path'].tolist() if len(held_out) else []
     # Relative names and byte sizes detect changed indexing without depending on mount location.
@@ -390,15 +450,20 @@ def fit_stage1():
     history, start_epoch = [], 1
     settings = dict(seed=seed, frames=frames, frame_batch=frame_batch,
                     config=model.config, dataset_fingerprint=fingerprint, precision=precision,
-                    batching='balanced_interleaved_v1', video_batch=videos)
+                    batching='balanced_interleaved_v1', video_batch=videos,
+                    training_version='groupnorm_hybrid_adamw_cosine_v2', evaluation_precision='fp32',
+                    sampling=sampling, aggregation='half_global_half_clips_softmax',
+                    schedule=dict(epochs=epochs, steps_per_epoch=steps_per_epoch,
+                                  warmup_epochs=warmup_epochs, peak_lr=peak_lr, min_lr=min_lr))
     if resume:
         saved = torch.load(MODEL / 'last.pt', map_location='cpu', weights_only=False)
         previous_settings = dict(saved['settings'])
         previous_precision = previous_settings.pop('precision', 'legacy_fp16')
         comparable_settings = {k: v for k, v in settings.items() if k != 'precision'}
         if previous_settings != comparable_settings or saved['split'] != split:
-            raise ValueError('Resume data split/config/batching differs. For the new balanced batches, '
-                             'use a new S1_MODEL_DIR with S1_RESUME=0.')
+            raise ValueError('Resume data/config/schedule differs. BN or global-only runs require a NEW '
+                             'S1_MODEL_DIR with S1_RESUME=0. For this training version, keep '
+                             'EPOCHS, LR, warmup, split and batching unchanged when resuming.')
         if previous_precision != precision:
             print(f'Resuming with precision change: {previous_precision} -> {precision}; '
                   'optimizer state is retained, FP16 scaler state is discarded.')
@@ -422,44 +487,61 @@ def fit_stage1():
         model.train()
         train_loss, samples_seen = 0., 0
         batches = list(balanced_video_batches(train, videos, rng))
+        lr_first = None
+        gradient_norms = []
         for step, indices in enumerate(batches, 1):
+            absolute_step = (epoch - 1) * steps_per_epoch + step - 1
+            lr = learning_rate_at(absolute_step, total_steps, warmup_steps, peak_lr, min_lr)
+            for group in optimizer.param_groups:
+                group['lr'] = lr
+            if lr_first is None:
+                lr_first = lr
             optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.
-            total_frames = len(indices) * frames
-            for part, labels in mixed_frame_batches(train, indices, model.config['size'],
-                                                     frames, frame_batch, rng):
+            for part, labels, weights in mixed_frame_batches(train, indices, model.config['size'],
+                                                             frames, frame_batch, rng, sampling):
                 part, labels = part.to(device), labels.to(device)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=precision == 'bf16'):
-                    loss = focal_loss(model(part), labels) * (len(part) / total_frames)
+                    loss = (focal_loss(model(part), labels, reduction='none') * weights.to(device)).sum()
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f'Nonfinite training loss for indices {indices}')
                 scaler.scale(loss).backward()
                 batch_loss += float(loss.detach())
             scaler.unscale_(optimizer)
-            clip_training_gradients(model, train.iloc[indices].path.tolist())
+            gradient_norms.append(float(clip_training_gradients(
+                model, train.iloc[indices].path.tolist())))
             scaler.step(optimizer)
             scaler.update()
             train_loss += batch_loss * len(indices)
             samples_seen += len(indices)
             if step == 1 or step % 25 == 0 or step == len(batches):
                 print(f'epoch={epoch}/{epochs} batch={step}/{len(batches)} '
-                      f'train_focal={train_loss / samples_seen:.6f}', flush=True)
-        metrics = validate(model, val, device, frames, frame_batch, precision)
-        record = dict(epoch=epoch, train_focal_loss=train_loss / samples_seen, **metrics)
+                      f'train_focal={train_loss / samples_seen:.6f} lr={lr:.3g}', flush=True)
+        # Always match submission precision, even if training uses BF16.
+        metrics = validate(model, val, device, frames, frame_batch, 'fp32', sampling)
+        record = dict(epoch=epoch, train_focal_loss=train_loss / samples_seen,
+                      lr_start=lr_first, lr_end=lr,
+                      gradient_norm_mean=float(np.mean(gradient_norms)),
+                      gradient_norm_max=float(max(gradient_norms)), **metrics)
         history.append(record)
+        stability = recent_stability(history)
+        record['recent_stability'] = stability
+        current_checkpoint = dict(architecture='cnn_vit_frame_v1',
+                        model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                        config=model.config, frames=frames, size=model.config['size'],
+                        sampling=sampling, preprocessing='rgb_0_1_adaptive_pool',
+                        aggregation='half_global_half_clips_softmax', threshold=threshold,
+                        evaluation_precision='fp32', epoch=epoch, metrics=metrics,
+                        recent_stability=stability, seed=seed, split=split)
         improved = (metrics['macro_f1'] > best_f1 or
                     (metrics['macro_f1'] == best_f1 and metrics['loss'] < best_loss))
         if improved:
             best_f1, best_loss, best_epoch = metrics['macro_f1'], metrics['loss'], epoch
             # Only selected epochs replace best.pt; includes inference configuration.
-            best_checkpoint = dict(architecture='cnn_vit_frame_v1',
-                            model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                            config=model.config, frames=frames, size=model.config['size'],
-                            sampling='temporal_bins_center', preprocessing='rgb_0_1_adaptive_pool',
-                            aggregation='mean_frame_softmax', threshold=threshold,
-                            epoch=epoch, metrics=metrics, seed=seed, split=split)
+            best_checkpoint = current_checkpoint
             atomic_torch_save(best_checkpoint, MODEL / 'best.pt')
+        atomic_torch_save(current_checkpoint, MODEL / 'final.pt')
         atomic_torch_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                                scaler=scaler.state_dict(), epoch=epoch, settings=settings,
                                split=split, history=history, best_f1=best_f1, best_loss=best_loss,
@@ -468,14 +550,27 @@ def fit_stage1():
                                cuda_rng=torch.cuda.get_rng_state_all() if device.type == 'cuda' else None,
                                python_rng=random.getstate()), MODEL / 'last.pt')
         with (MODEL / 'training_history.json').open('w', encoding='utf-8') as handle:
-            json.dump(dict(seed=seed, split=split, best_epoch=best_epoch, epochs=history),
+            json.dump(dict(seed=seed, split=split, settings=settings, best_epoch=best_epoch,
+                           final_epoch=epoch, recent_stability=stability, epochs=history),
                       handle, ensure_ascii=False, indent=2)
         print(f"epoch={epoch}/{epochs} train_focal={record['train_focal_loss']:.6f} "
               f"val_loss={metrics['loss']:.6f} macro_f1={metrics['macro_f1']:.4f} "
               f"accuracy={metrics['accuracy']:.4f} recall_O={metrics['recall_original']:.4f} "
               f"recall_R={metrics['recall_rerecorded']:.4f} "
-              f"confusion={metrics['confusion_matrix']} best_epoch={best_epoch}")
+              f"confusion={metrics['confusion_matrix']} best_epoch={best_epoch} "
+              f"recent{stability['window']}_f1={stability['macro_f1_mean']:.4f} "
+              f"std={stability['macro_f1_std']:.4f}", flush=True)
+        if min(metrics['recall_original'], metrics['recall_rerecorded']) < .05:
+            print('Validation class recall is below 5%; predictions remain strongly skewed. '
+                  'More epochs alone do not establish convergence.', flush=True)
     print(f'Stage 1 complete: best epoch={best_epoch}, Macro-F1={best_f1:.4f}')
+    if history:
+        recent = recent_stability(history)
+        print(f"Final epoch={history[-1]['epoch']}, Macro-F1={history[-1]['macro_f1']:.4f}; "
+              f"recent {recent['window']} epochs mean={recent['macro_f1_mean']:.4f}, "
+              f"std={recent['macro_f1_std']:.4f}, "
+              f"minimum class recall={recent['min_class_recall']:.4f}. "
+              f"Inference checkpoint: {MODEL / 'final.pt'}", flush=True)
 
 
 if __name__ == '__main__':

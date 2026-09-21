@@ -43,15 +43,18 @@ def _video_paths(root: Path):
 # ---------------------------------------------------------------------------
 def predict_stage1(data_dir, model_dir):
     # Local import keeps Stage 2/3 independent of Stage 1 model construction.
-    from models.stage1_model import Stage1CNNViT, load_stage1_video
+    from models.stage1_model import Stage1CNNViT, load_stage1_video, HYBRID_SAMPLING
 
     device = _device()
     checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
     if checkpoint.get("architecture") != "cnn_vit_frame_v1":
         raise ValueError("Stage 1 requires a newly trained CNN-ViT best.pt (old MViT weights are incompatible).")
-    if (checkpoint.get("sampling") != "temporal_bins_center"
+    sampling = checkpoint.get("sampling")
+    aggregation = {"temporal_bins_center": "mean_frame_softmax",
+                   HYBRID_SAMPLING: "half_global_half_clips_softmax"}
+    if (sampling not in aggregation
             or checkpoint.get("preprocessing") != "rgb_0_1_adaptive_pool"
-            or checkpoint.get("aggregation") != "mean_frame_softmax"):
+            or checkpoint.get("aggregation") != aggregation.get(sampling)):
         raise ValueError("Unsupported Stage 1 checkpoint preprocessing or aggregation.")
     model = Stage1CNNViT(**checkpoint["config"])
     model.load_state_dict(checkpoint["model"])
@@ -66,9 +69,11 @@ def predict_stage1(data_dir, model_dir):
     with torch.inference_mode():
         for path in videos:
             # Identical full-frame preprocessing and bin centers to validation.
-            clip = load_stage1_video(path, size=size, frames=frames)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                probability = model.video_probability(clip[None].to(device), frame_batch_size=16)[0, 1]
+            clip = load_stage1_video(path, size=size, frames=frames, sampling=sampling)
+            # Match Stage 1 validation: FP32, including when called under autocast.
+            with torch.autocast(device_type="cuda", enabled=False):
+                probability = model.video_probability(clip[None].to(device), frame_batch_size=16,
+                                                       sampling=sampling)[0, 1]
             probability = float(probability)
             if not np.isfinite(probability):
                 raise ValueError(f"Nonfinite Stage 1 prediction: {path.name}")
