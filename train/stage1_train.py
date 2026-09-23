@@ -2,7 +2,13 @@
 
 Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
+S1_FEATURES=cnn_ltc (default): regional HSV LTC + CNN tokens -> spatial ViT.
+S1_FEATURES=cnn restores the previous architecture for controlled comparisons.
+LTC runs on-device per resized frame, with no additional dependencies or cache.
+Use a NEW S1_MODEL_DIR for LTC; CNN-only optimizer checkpoints cannot resume it.
 S1_MODE=diagnose_bn evaluates a checkpoint copy and writes only bn_diagnostics.json.
+S1_MODE=diagnose_sampling compares global/clip/hybrid predictions on the saved
+validation split, using one frozen checkpoint; writes sampling_diagnostics.json.
 Training uses S1_VIDEO_BATCH=4 (or 2), interleaved across frame microbatches.
 Each video supplies 16 global frames + 3 consecutive clips of 16 frames.
 Global frames receive half the loss weight; the three clips share the other half.
@@ -36,7 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if __package__ in (None, ''):
     sys.path.insert(0, str(ROOT))
 from models.stage1_model import Stage1CNNViT, focal_loss, load_stage1_video, sample_frame_ids
-from models.stage1_model import HYBRID_SAMPLING, frame_weights
+from models.stage1_model import HYBRID_SAMPLING, LTC_ARCHITECTURE, frame_weights
 
 DATA = ROOT / 'data' / 'stage1'
 MODEL = ROOT / 'model' / 'stage1'
@@ -364,6 +370,82 @@ def diagnose_bn(df, held_out, device, frame_batch, videos):
     print(f'Report saved: {report_path}. No checkpoint weights were written.', flush=True)
 
 
+@torch.inference_mode()
+def diagnose_sampling(df, held_out, device, frame_batch):
+    """Ablate inference sampling only; never tune on official test or write weights."""
+    path = Path(os.getenv('S1_CHECKPOINT', str(MODEL / 'best.pt'))).resolve()
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if (checkpoint.get('architecture') not in ('cnn_vit_frame_v1', LTC_ARCHITECTURE)
+            or checkpoint.get('sampling') != HYBRID_SAMPLING
+            or checkpoint.get('aggregation') != 'half_global_half_clips_softmax'
+            or checkpoint.get('preprocessing') != 'rgb_0_1_adaptive_pool'):
+        raise ValueError('Sampling diagnosis requires a hybrid best.pt or final.pt checkpoint.')
+    split = checkpoint['split']
+    indexed = df.set_index('path', drop=False)
+    if not indexed.index.is_unique:
+        raise ValueError('Duplicate data paths')
+    if (len(set(split['validation'])) != len(split['validation'])
+            or set(split['train']) & set(split['validation'])):
+        raise ValueError('Invalid saved validation split')
+    train = indexed.loc[split['train']]
+    val = indexed.loc[split['validation']]
+    group_col = next((c for c in ('source_id', 'group_id') if c in df), None)
+    if group_col:
+        if set(train[group_col]) & set(val[group_col]):
+            raise ValueError('Training/validation source overlap')
+        if len(held_out) and group_col in held_out:
+            if (set(train[group_col]) | set(val[group_col])) & set(held_out[group_col]):
+                raise ValueError('Official test source overlap')
+    model = Stage1CNNViT(**checkpoint['config']).to(device).eval()
+    model.load_state_dict(checkpoint['model'], strict=True)
+    frames, threshold = int(checkpoint['frames']), float(checkpoint['threshold'])
+    if frames < 1 or not 0 <= threshold <= 1:
+        raise ValueError('Invalid checkpoint frames/threshold')
+    print(f'Sampling diagnosis: epoch={checkpoint["epoch"]}; norm={model.config["norm"]}; '
+          f'validation={len(val)}; threshold={threshold}; fp32; weights frozen', flush=True)
+    predictions = []
+    for number, row in enumerate(val.itertuples(index=False), 1):
+        clip = load_row(row, model.config['size'], frames, sampling=HYBRID_SAMPLING)
+        x = clip.permute(1, 0, 2, 3)
+        # Reuse exactly the same decoded frames and logits for all three variants.
+        with torch.autocast(device_type=device.type, enabled=False):
+            p = torch.cat([model(part.to(device)).float().softmax(-1)[:, 1]
+                           for part in x.split(frame_batch)])
+        if len(p) != 4 * frames or not torch.isfinite(p).all():
+            raise ValueError(f'Invalid predictions for {row.path}')
+        global_p = float(p[:frames].mean())
+        clips_p = float(p[frames:].mean())
+        hybrid_p = float((p * frame_weights(frames, HYBRID_SAMPLING).to(device)).sum())
+        predictions.append(dict(path=row.path, label=LABELS[row.label],
+                                global_only=global_p, clips_only=clips_p, hybrid=hybrid_p))
+        if number == 1 or number % 25 == 0 or number == len(val):
+            print(f'Diagnosis: {number}/{len(val)} videos', flush=True)
+    labels = [r['label'] for r in predictions]
+    metrics = {mode: classification_metrics(labels, [r[mode] for r in predictions], threshold)
+               for mode in ('global_only', 'clips_only', 'hybrid')}
+    saved_metrics = checkpoint.get('metrics', {})
+    compared_keys = ('macro_f1', 'accuracy', 'loss')
+    reproduced = (all(k in saved_metrics for k in compared_keys)
+                  and all(abs(metrics['hybrid'][k] - saved_metrics[k]) <= 1e-5
+                          for k in compared_keys))
+    report = dict(checkpoint=str(path), checkpoint_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                  epoch=checkpoint['epoch'], config=checkpoint['config'], frames_per_group=frames,
+                  sampling=checkpoint['sampling'], aggregation=checkpoint['aggregation'],
+                  evaluation_split='saved_validation_only', precision='fp32', threshold=threshold,
+                  validation_count=len(val), saved_metrics=saved_metrics,
+                  hybrid_reproduces_saved_metrics=reproduced, metrics=metrics, predictions=predictions)
+    MODEL.mkdir(parents=True, exist_ok=True)
+    output = MODEL / 'sampling_diagnostics.json'
+    if output.resolve() == path:
+        raise ValueError('Report path conflicts with checkpoint')
+    temporary = output.with_suffix('.tmp')
+    temporary.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    os.replace(temporary, output)
+    print(json.dumps(metrics, indent=2), flush=True)
+    print(f'Hybrid reproduces saved metrics: {reproduced}. Report: {output}. '
+          'No checkpoint weights were written.', flush=True)
+
+
 def fit_stage1():
     global DATA, MODEL
     DATA = Path(os.getenv('S1_DATA_DIR', str(DATA))).expanduser().resolve()
@@ -394,12 +476,16 @@ def fit_stage1():
     else:
         raise ValueError('S1_DATASET must be videos or vdmoire')
     mode = os.getenv('S1_MODE', 'train')
+    if mode == 'diagnose_sampling':
+        cv2.setNumThreads(1)
+        diagnose_sampling(df, held_out, device, frame_batch)
+        return
     if mode == 'diagnose_bn':
         cv2.setNumThreads(1)
         diagnose_bn(df, held_out, device, frame_batch, videos)
         return
     if mode != 'train':
-        raise ValueError('S1_MODE must be train or diagnose_bn')
+        raise ValueError('S1_MODE must be train, diagnose_bn or diagnose_sampling')
     train, val = split_by_source(df, float(os.getenv('S1_VAL_RATIO', '.2')), seed)
     if 'frame_paths' not in df:
         for path in df['path']:
@@ -409,7 +495,10 @@ def fit_stage1():
     if not resume and any((MODEL / name).exists() for name in ('best.pt', 'last.pt', 'final.pt')):
         raise ValueError('Output contains checkpoints: use S1_RESUME=1 or a new S1_MODEL_DIR.')
     cv2.setNumThreads(1)
-    model = Stage1CNNViT(norm='group').to(device)
+    feature_mode = os.getenv('S1_FEATURES', 'cnn_ltc').lower()
+    if feature_mode not in ('cnn', 'cnn_ltc'):
+        raise ValueError('S1_FEATURES must be cnn or cnn_ltc')
+    model = Stage1CNNViT(norm='group', use_ltc=feature_mode == 'cnn_ltc').to(device)
     peak_lr = float(os.getenv('S1_LR', '0.00001'))
     min_lr = float(os.getenv('S1_MIN_LR', str(peak_lr * .1)))
     warmup_epochs = int(os.getenv('S1_WARMUP_EPOCHS', str(min(3, epochs - 1))))
@@ -436,6 +525,9 @@ def fit_stage1():
           f'validation={len(val)}; source groups split')
     print(f'norm=group; optimizer=AdamW; lr={peak_lr:g}->{min_lr:g}; '
           f'warmup={warmup_epochs} epochs; validation=fp32', flush=True)
+    print(f'features={feature_mode}; architecture={model.architecture}; '
+          f'input={model.config["size"]}x{model.config["size"]}; '
+          'LTC uses fixed per-frame statistics on resized RGB when enabled.', flush=True)
     print('Sampling: global 16 + three continuous 16-frame clips; '
           'weights=50% global / 50% clips; randomized train centers, fixed eval centers.', flush=True)
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
@@ -451,7 +543,8 @@ def fit_stage1():
     settings = dict(seed=seed, frames=frames, frame_batch=frame_batch,
                     config=model.config, dataset_fingerprint=fingerprint, precision=precision,
                     batching='balanced_interleaved_v1', video_batch=videos,
-                    training_version='groupnorm_hybrid_adamw_cosine_v2', evaluation_precision='fp32',
+                    training_version=('groupnorm_hybrid_ltc_v1' if model.use_ltc else
+                                      'groupnorm_hybrid_adamw_cosine_v2'), evaluation_precision='fp32',
                     sampling=sampling, aggregation='half_global_half_clips_softmax',
                     schedule=dict(epochs=epochs, steps_per_epoch=steps_per_epoch,
                                   warmup_epochs=warmup_epochs, peak_lr=peak_lr, min_lr=min_lr))
@@ -461,7 +554,7 @@ def fit_stage1():
         previous_precision = previous_settings.pop('precision', 'legacy_fp16')
         comparable_settings = {k: v for k, v in settings.items() if k != 'precision'}
         if previous_settings != comparable_settings or saved['split'] != split:
-            raise ValueError('Resume data/config/schedule differs. BN or global-only runs require a NEW '
+            raise ValueError('Resume data/config/schedule differs. Changed feature architecture requires a NEW '
                              'S1_MODEL_DIR with S1_RESUME=0. For this training version, keep '
                              'EPOCHS, LR, warmup, split and batching unchanged when resuming.')
         if previous_precision != precision:
@@ -527,7 +620,7 @@ def fit_stage1():
         history.append(record)
         stability = recent_stability(history)
         record['recent_stability'] = stability
-        current_checkpoint = dict(architecture='cnn_vit_frame_v1',
+        current_checkpoint = dict(architecture=model.architecture,
                         model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                         config=model.config, frames=frames, size=model.config['size'],
                         sampling=sampling, preprocessing='rgb_0_1_adaptive_pool',

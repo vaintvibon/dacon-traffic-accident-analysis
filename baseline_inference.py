@@ -39,48 +39,95 @@ def _video_paths(root: Path):
 
 # BASELINE_INFERENCE_PART
 # ---------------------------------------------------------------------------
-# Stage 1: spatial CNN -> ViT with full-video stratified frame sampling
+# Stage 1: MViTv2-S 기반 재녹화 분류기
 # ---------------------------------------------------------------------------
-def predict_stage1(data_dir, model_dir):
-    # Local import keeps Stage 2/3 independent of Stage 1 model construction.
-    from models.stage1_model import Stage1CNNViT, load_stage1_video, HYBRID_SAMPLING, LTC_ARCHITECTURE
+def _clip_ids(path: Path, n: int, slot: int, slots: int):
+    cap = cv2.VideoCapture(str(path))
+    total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    cap.release()
+    center = (slot + 0.5) * total / slots
+    start = max(0, min(total - n, round(center - n / 2)))
+    return np.linspace(start, min(total - 1, start + n - 1), n).round().astype(int)
 
+
+def _decode_stage1_clip(path: Path, size: int, frame_ids):
+    cap = cv2.VideoCapture(str(path))
+    out = []
+    wanted = [int(x) for x in frame_ids]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
+    pos = wanted[0]
+    for idx in wanted:
+        ok = False
+        bgr = None
+        while pos <= idx:
+            ok, bgr = cap.read()
+            pos += 1
+            if not ok:
+                break
+        if not ok or bgr is None:
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        scale = size / min(h, w)
+        nh, nw = max(size, round(h * scale)), max(size, round(w * scale))
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+        y, x = (nh - size) // 2, (nw - size) // 2
+        out.append(rgb[y : y + size, x : x + size])
+    cap.release()
+    if not out:
+        raise ValueError(f"cannot decode video: {path.name}")
+    while len(out) < len(wanted):
+        out.append(out[-1])
+    x = torch.from_numpy(np.stack(out)).permute(3, 0, 1, 2).float() / 255.0
+    return (x - S1_MEAN) / S1_STD
+
+
+class _Stage1Clips(Dataset):
+    def __init__(self, videos, slots, size, frames):
+        self.videos, self.slots, self.size, self.frames = videos, slots, size, frames
+
+    def __len__(self):
+        return len(self.videos) * self.slots
+
+    def __getitem__(self, index):
+        video_index, slot = index // self.slots, index % self.slots
+        path = self.videos[video_index]
+        try:
+            x = _decode_stage1_clip(path, self.size, _clip_ids(path, self.frames, slot, self.slots))
+            valid = 1
+        except Exception:
+            x = torch.zeros(3, self.frames, self.size, self.size)
+            valid = 0
+        return x, video_index, valid
+
+
+def predict_stage1(data_dir, model_dir):
     device = _device()
     checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
-    if checkpoint.get("architecture") not in ("cnn_vit_frame_v1", LTC_ARCHITECTURE):
-        raise ValueError("Stage 1 requires a newly trained CNN-ViT best.pt (old MViT weights are incompatible).")
-    sampling = checkpoint.get("sampling")
-    aggregation = {"temporal_bins_center": "mean_frame_softmax",
-                   HYBRID_SAMPLING: "half_global_half_clips_softmax"}
-    if (sampling not in aggregation
-            or checkpoint.get("preprocessing") != "rgb_0_1_adaptive_pool"
-            or checkpoint.get("aggregation") != aggregation.get(sampling)):
-        raise ValueError("Unsupported Stage 1 checkpoint preprocessing or aggregation.")
-    model = Stage1CNNViT(**checkpoint["config"])
-    if checkpoint['architecture'] != model.architecture:
-        raise ValueError('Stage 1 architecture and configuration disagree.')
+    size, frames = int(checkpoint["size"]), int(checkpoint["frames"])
+    model = mvit_v2_s(weights=None)
+    model.head[1] = nn.Linear(model.head[1].in_features, 2)
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
-    frames = int(checkpoint["frames"])
-    size = int(checkpoint["config"]["size"])
-    threshold = float(checkpoint["threshold"])
-    if frames < 1 or not 0 <= threshold <= 1:
-        raise ValueError("Invalid Stage 1 frames or threshold.")
-    videos = _video_paths(Path(data_dir) / "videos")
-    rows = []
+
+    root = Path(data_dir) / "videos"
+    videos = _video_paths(root)
+    slots = 3
+    dataset = _Stage1Clips(videos, slots, size, frames)
+    loader = DataLoader(dataset, batch_size=4, num_workers=4, pin_memory=True)
+    scores = [[] for _ in videos]
     with torch.inference_mode():
-        for path in videos:
-            # Identical full-frame preprocessing and bin centers to validation.
-            clip = load_stage1_video(path, size=size, frames=frames, sampling=sampling)
-            # Match Stage 1 validation: FP32, including when called under autocast.
-            with torch.autocast(device_type="cuda", enabled=False):
-                probability = model.video_probability(clip[None].to(device), frame_batch_size=16,
-                                                       sampling=sampling)[0, 1]
-            probability = float(probability)
-            if not np.isfinite(probability):
-                raise ValueError(f"Nonfinite Stage 1 prediction: {path.name}")
-            rows.append({"ID": path.stem,
-                         "answer": "RERECORDED" if probability >= threshold else "ORIGINAL"})
+        for clips, video_indices, valid in loader:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                prob = torch.softmax(model(clips.to(device, non_blocking=True)), 1)[:, 1]
+            for idx, value, ok in zip(video_indices.tolist(), prob.float().cpu().tolist(), valid.tolist()):
+                if ok:
+                    scores[idx].append(float(value))
+
+    rows = []
+    for path, values in zip(videos, scores):
+        probability = float(np.mean(values)) if values else 1.0
+        rows.append({"ID": path.stem, "answer": "RERECORDED" if probability >= 0.5 else "ORIGINAL"})
     del model
     torch.cuda.empty_cache()
     return pd.DataFrame(rows, columns=["ID", "answer"])
