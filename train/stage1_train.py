@@ -4,6 +4,10 @@ Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
 S1_FEATURES=cnn_ltc (default): regional HSV LTC + CNN tokens -> spatial ViT.
 S1_FEATURES=cnn restores the previous architecture for controlled comparisons.
+S1_DATASET=icl indexes SingleCaptureImages/RecapturedImages under S1_DATA_DIR,
+excludes 'not used', and trains/validates once per image using source groups.
+ICL checkpoints retain 16+3x16 video sampling for deployment; their saved
+validation metrics are image-level, not measured video metrics.
 LTC runs on-device per resized frame, with no additional dependencies or cache.
 Use a NEW S1_MODEL_DIR for LTC; CNN-only optimizer checkpoints cannot resume it.
 S1_MODE=diagnose_bn evaluates a checkpoint copy and writes only bn_diagnostics.json.
@@ -122,6 +126,57 @@ def index_vdmoire(root):
     test = df[df.official_split == 'test'].copy()
     print(f'VDmoire: {len(train)} train sequences; {len(test)} official test sequences held out.')
     return train.reset_index(drop=True), test.reset_index(drop=True)
+
+
+def index_icl(root):
+    """Match filename source identities, not recapturing camera identities.
+
+    Excludes the archive's 'not used' directory. Unknown names, duplicate
+    originals and unmatched recaptures fail rather than silently leaking groups.
+    This groups exact source images; it does not establish scene-level identity.
+    """
+    root = Path(root)
+    records, originals = [], set()
+    def camera(value):
+        value = value.upper()
+        return {'600D': 'EOS600D', '60D': 'EOS60D'}.get(value, value)
+    for label, folder in [('ORIGINAL', 'SingleCaptureImages'),
+                          ('RERECORDED', 'RecapturedImages')]:
+        directories = [root] if root.name == folder else list(root.rglob(folder))
+        if len(directories) != 1:
+            raise ValueError(f'Expected one {folder} directory under {root}: {directories}')
+        for path in sorted(directories[0].rglob('*')):
+            if (not path.is_file() or path.suffix.lower() not in ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
+                    or any(p.lower() in ('not used', '__macosx') for p in path.parts)
+                    or path.name.startswith('._')):
+                continue
+            if label == 'ORIGINAL':
+                match = re.fullmatch(r'(DS-\d+)-(\d+)-S%([^%]+)', path.stem, re.I)
+                if not match:
+                    raise ValueError(f'Unknown ICL original filename: {path}')
+                dataset, number, source_camera = match.groups()
+            else:
+                match = re.fullmatch(r'(DS-\d+)-R%[^%]+%[^%]+%([^%]+)-(\d+)', path.stem, re.I)
+                if not match:
+                    raise ValueError(f'Unknown ICL recapture filename: {path}')
+                dataset, source_camera, number = match.groups()
+            source_id = f'{dataset.upper()}/{camera(source_camera)}/{int(number)}'
+            if label == 'ORIGINAL':
+                if source_id in originals:
+                    raise ValueError(f'Duplicate ICL original identity: {source_id}')
+                originals.add(source_id)
+            relative = path.relative_to(root).as_posix()
+            records.append(dict(path=relative, label=label, source_id=source_id,
+                                frame_paths=[relative]))
+    unmatched = {r['source_id'] for r in records if r['label'] == 'RERECORDED'} - originals
+    if unmatched:
+        raise ValueError(f'ICL recaptures without matching originals: {sorted(unmatched)[:20]}')
+    df = pd.DataFrame(records)
+    if not len(df) or set(df.label) != set(LABELS):
+        raise ValueError('ICL requires both original and recaptured images')
+    print(f'ICL: {df.label.value_counts().to_dict()}; {df.source_id.nunique()} source groups; '
+          'not used excluded; image validation (not video performance).', flush=True)
+    return df, pd.DataFrame()
 
 
 def load_row(row, size, frames=16, rng=None, sampling='temporal_bins_center'):
@@ -375,6 +430,8 @@ def diagnose_sampling(df, held_out, device, frame_batch):
     """Ablate inference sampling only; never tune on official test or write weights."""
     path = Path(os.getenv('S1_CHECKPOINT', str(MODEL / 'best.pt'))).resolve()
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if checkpoint.get('validation_unit') == 'image':
+        raise ValueError('Image validation checkpoints cannot reproduce video sampling metrics.')
     if (checkpoint.get('architecture') not in ('cnn_vit_frame_v1', LTC_ARCHITECTURE)
             or checkpoint.get('sampling') != HYBRID_SAMPLING
             or checkpoint.get('aggregation') != 'half_global_half_clips_softmax'
@@ -468,14 +525,19 @@ def fit_stage1():
     precision = precision_mode(device)
     cv_threads = int(os.getenv('S1_TORCH_THREADS', '4'))
     torch.set_num_threads(max(1, cv_threads))
-    if os.getenv('S1_DATASET', 'videos') == 'vdmoire':
+    image_dataset = os.getenv('S1_DATASET', 'videos') == 'icl'
+    if image_dataset:
+        df, held_out = index_icl(DATA)
+    elif os.getenv('S1_DATASET', 'videos') == 'vdmoire':
         df, held_out = index_vdmoire(DATA)
     elif os.getenv('S1_DATASET', 'videos') == 'videos':
         df = pd.read_csv(DATA / 'labels.csv', dtype={'source_id': str, 'group_id': str})
         held_out = pd.DataFrame()
     else:
-        raise ValueError('S1_DATASET must be videos or vdmoire')
+        raise ValueError('S1_DATASET must be videos, vdmoire or icl')
     mode = os.getenv('S1_MODE', 'train')
+    if image_dataset and mode != 'train':
+        raise ValueError('ICL supports train mode with single-image validation; video diagnostics are not applicable.')
     if mode == 'diagnose_sampling':
         cv2.setNumThreads(1)
         diagnose_sampling(df, held_out, device, frame_batch)
@@ -515,8 +577,8 @@ def fit_stage1():
     # FP32/BF16 do not need FP16 loss scaling. Keep the disabled scaler for the
     # existing checkpoint structure, without multiplying gradients by 65536.
     scaler = torch.amp.GradScaler('cuda', enabled=False)
-    frames, threshold = 16, .5
-    sampling = HYBRID_SAMPLING
+    frames, threshold = (1 if image_dataset else 16), .5
+    sampling = 'temporal_bins_center' if image_dataset else HYBRID_SAMPLING
     rng = np.random.default_rng(seed)
     split = {'train': train['path'].tolist(), 'validation': val['path'].tolist(),
              'train_groups': sorted(train['_group'].unique().tolist()),
@@ -528,7 +590,8 @@ def fit_stage1():
     print(f'features={feature_mode}; architecture={model.architecture}; '
           f'input={model.config["size"]}x{model.config["size"]}; '
           'LTC uses fixed per-frame statistics on resized RGB when enabled.', flush=True)
-    print('Sampling: global 16 + three continuous 16-frame clips; '
+    print('Sampling: one image per example, no repeated frames.' if image_dataset else
+          'Sampling: global 16 + three continuous 16-frame clips; '
           'weights=50% global / 50% clips; randomized train centers, fixed eval centers.', flush=True)
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
     split['official_test'] = held_out['path'].tolist() if len(held_out) else []
@@ -545,7 +608,7 @@ def fit_stage1():
                     batching='balanced_interleaved_v1', video_batch=videos,
                     training_version=('groupnorm_hybrid_ltc_v1' if model.use_ltc else
                                       'groupnorm_hybrid_adamw_cosine_v2'), evaluation_precision='fp32',
-                    sampling=sampling, aggregation='half_global_half_clips_softmax',
+                    sampling=sampling, aggregation=('mean_frame_softmax' if image_dataset else 'half_global_half_clips_softmax'),
                     schedule=dict(epochs=epochs, steps_per_epoch=steps_per_epoch,
                                   warmup_epochs=warmup_epochs, peak_lr=peak_lr, min_lr=min_lr))
     if resume:
@@ -622,8 +685,10 @@ def fit_stage1():
         record['recent_stability'] = stability
         current_checkpoint = dict(architecture=model.architecture,
                         model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-                        config=model.config, frames=frames, size=model.config['size'],
-                        sampling=sampling, preprocessing='rgb_0_1_adaptive_pool',
+                        config=model.config, frames=16, size=model.config['size'],
+                        sampling=HYBRID_SAMPLING, preprocessing='rgb_0_1_adaptive_pool',
+                        training_dataset=os.getenv('S1_DATASET', 'videos'),
+                        validation_unit='image' if image_dataset else 'video',
                         aggregation='half_global_half_clips_softmax', threshold=threshold,
                         evaluation_precision='fp32', epoch=epoch, metrics=metrics,
                         recent_stability=stability, seed=seed, split=split)
