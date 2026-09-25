@@ -503,6 +503,109 @@ def diagnose_sampling(df, held_out, device, frame_batch):
           'No checkpoint weights were written.', flush=True)
 
 
+@torch.inference_mode()
+def diagnose_checkpoints(df, device):
+    """Read-only ICL best/final comparison; repeat the saved validation protocol."""
+    paths = {name: MODEL / f'{name}.pt' for name in ('best', 'final')}
+    hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
+    checkpoints = {name: torch.load(path, map_location='cpu', weights_only=False)
+                   for name, path in paths.items()}
+    best, final = checkpoints['best'], checkpoints['final']
+    if best['split'] != final['split'] or best['config'] != final['config']:
+        raise ValueError('best/final must have identical splits and model configurations')
+    if any(c.get('validation_unit') != 'image' or c.get('training_dataset') != 'icl'
+           for c in checkpoints.values()):
+        raise ValueError('Diagnosis requires ICL image-validation checkpoints')
+    if best['threshold'] != final['threshold']:
+        raise ValueError('best/final thresholds differ')
+    indexed = df.set_index('path', drop=False)
+    split = best['split']
+    subsets = {}
+    for key in ('train', 'validation'):
+        names = split[key]
+        if len(names) != len(set(names)) or not names:
+            raise ValueError(f'Invalid saved {key} split')
+        subsets[key] = indexed.loc[names]
+    if set(subsets['train'].source_id) & set(subsets['validation'].source_id):
+        raise ValueError('Source overlap between train and validation')
+    report = dict(precision='fp32', validation_unit='image', checkpoints={},
+                  threshold=float(best['threshold']), predictions={})
+    threshold = report['threshold']
+    def evaluate(model, subset, title):
+        probabilities = []
+        for number, row in enumerate(subset.itertuples(index=False), 1):
+            clip = load_row(row, model.config['size'], frames=1)
+            with torch.autocast(device_type=device.type, enabled=False):
+                p = model.video_probability(clip[None].to(device), 1)[0, 1]
+            probabilities.append(float(p))
+            if number == 1 or number % 50 == 0 or number == len(subset):
+                print(f'{title}: {number}/{len(subset)} images', flush=True)
+        return np.asarray(probabilities)
+    for name, checkpoint in checkpoints.items():
+        model = Stage1CNNViT(**checkpoint['config']).to(device).eval()
+        if checkpoint['architecture'] != model.architecture:
+            raise ValueError('Checkpoint architecture/config mismatch')
+        model.load_state_dict(checkpoint['model'], strict=True)
+        entry = dict(path=str(paths[name]), sha256=hashes[name], epoch=checkpoint['epoch'])
+        for key, subset in subsets.items():
+            p = evaluate(model, subset, f'{name}/{key}')
+            labels = np.array([LABELS[label] for label in subset.label])
+            entry[key] = classification_metrics(labels, p, threshold)
+            entry[key]['probability_by_class'] = {
+                label: dict(zip(('p10', 'median', 'p90', 'mean'),
+                                map(float, [*np.quantile(p[labels == code], [.1, .5, .9]),
+                                            p[labels == code].mean()])))
+                for label, code in LABELS.items()}
+            if key == 'validation':
+                again = evaluate(model, subset, f'{name}/validation_repeat')
+                entry['repeat_max_probability_difference'] = float(np.max(np.abs(p - again)))
+                entry['repeat_changed_predictions'] = int(np.sum((p >= threshold) != (again >= threshold)))
+                saved = checkpoint['metrics']
+                entry['saved_metrics_reproduced'] = all(
+                    abs(entry[key][k] - saved[k]) <= 1e-5 for k in ('macro_f1', 'accuracy', 'loss'))
+                records = []
+                for row, label, probability in zip(subset.itertuples(index=False), labels, p):
+                    stem = Path(row.path).stem
+                    recapture = row.label == 'RERECORDED'
+                    records.append(dict(path=row.path, source_id=row.source_id, label=int(label),
+                                        probability=float(probability), prediction=int(probability >= threshold),
+                                        source_camera=row.source_id.split('/')[1],
+                                        capture_camera=stem.split('%')[1].upper() if recapture else
+                                                       row.source_id.split('/')[1]))
+                report['predictions'][name] = records
+                entry['camera_errors'] = {}
+                for field in ('source_camera', 'capture_camera'):
+                    groups = {}
+                    for r in records:
+                        group = f'{r["label"]}/{r[field]}'
+                        values = groups.setdefault(group, dict(count=0, errors=0))
+                        values['count'] += 1
+                        values['errors'] += int(r['label'] != r['prediction'])
+                    entry['camera_errors'][field] = groups
+        report['checkpoints'][name] = entry
+        del model
+    pairs = zip(report['predictions']['best'], report['predictions']['final'])
+    changed = []
+    for before, after in pairs:
+        if before['prediction'] != after['prediction']:
+            changed.append(dict(path=before['path'], label=before['label'],
+                                best_probability=before['probability'], final_probability=after['probability'],
+                                became_wrong=after['prediction'] != after['label']))
+    report['changed_predictions'] = changed
+    report['change_summary'] = dict(count=len(changed),
+                                   correct_to_wrong=sum(r['became_wrong'] for r in changed),
+                                   wrong_to_correct=sum(not r['became_wrong'] for r in changed))
+    for name, path in paths.items():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != hashes[name]:
+            raise RuntimeError(f'Checkpoint changed during diagnosis: {path}')
+    output = MODEL / 'checkpoint_diagnostics.json'
+    temporary = output.with_suffix('.tmp')
+    temporary.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    os.replace(temporary, output)
+    print(json.dumps(report['checkpoints'], indent=2), flush=True)
+    print(f'Report: {output}. Checkpoint hashes unchanged.', flush=True)
+
+
 def fit_stage1():
     global DATA, MODEL
     DATA = Path(os.getenv('S1_DATA_DIR', str(DATA))).expanduser().resolve()
@@ -536,6 +639,12 @@ def fit_stage1():
     else:
         raise ValueError('S1_DATASET must be videos, vdmoire or icl')
     mode = os.getenv('S1_MODE', 'train')
+    if mode == 'diagnose_checkpoints':
+        if not image_dataset:
+            raise ValueError('diagnose_checkpoints currently requires S1_DATASET=icl')
+        cv2.setNumThreads(1)
+        diagnose_checkpoints(df, device)
+        return
     if image_dataset and mode != 'train':
         raise ValueError('ICL supports train mode with single-image validation; video diagnostics are not applicable.')
     if mode == 'diagnose_sampling':
