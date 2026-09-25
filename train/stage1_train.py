@@ -2,6 +2,12 @@
 
 Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
+ICL stability experiment: S1_ACCUM_STEPS=8 with S1_VIDEO_BATCH=4 gives
+32 images/update; S1_EMA_DECAY=0.99 averages weights after optimizer updates.
+Defaults remain accumulation=1/EMA disabled. EMA runs select best.pt and
+final.pt using EMA; final_raw.pt preserves final raw weights. History includes
+both validation metrics/stability; last.pt restores raw/EMA/optimizer/RNG.
+S1_SPLIT_REFERENCE=<previous training_history.json> asserts identical splits.
 S1_FEATURES=cnn_ltc (default): regional HSV LTC + CNN tokens -> spatial ViT.
 S1_FEATURES=cnn restores the previous architecture for controlled comparisons.
 S1_DATASET=icl indexes SingleCaptureImages/RecapturedImages under S1_DATA_DIR,
@@ -36,6 +42,7 @@ import math
 import cv2
 import os
 import random
+import copy
 import sys
 
 import numpy as np
@@ -675,7 +682,13 @@ def fit_stage1():
     warmup_epochs = int(os.getenv('S1_WARMUP_EPOCHS', str(min(3, epochs - 1))))
     if not 0 <= warmup_epochs < epochs or not 0 < min_lr <= peak_lr:
         raise ValueError('Require 0 <= warmup epochs < EPOCHS and 0 < min LR <= peak LR.')
-    steps_per_epoch = math.ceil(2 * int(train.label.value_counts().max()) / videos)
+    accumulation = int(os.getenv('S1_ACCUM_STEPS', '1'))
+    ema_decay = float(os.getenv('S1_EMA_DECAY', '0'))
+    if accumulation < 1 or not 0 <= ema_decay < 1:
+        raise ValueError('Require positive S1_ACCUM_STEPS and 0 <= S1_EMA_DECAY < 1')
+    ema = copy.deepcopy(model).eval().requires_grad_(False) if ema_decay else None
+    micro_steps = math.ceil(2 * int(train.label.value_counts().max()) / videos)
+    steps_per_epoch = math.ceil(micro_steps / accumulation)
     total_steps, warmup_steps = epochs * steps_per_epoch, warmup_epochs * steps_per_epoch
     # Decoupled decay only on matrix/kernel weights, not norm scales or biases.
     decay, no_decay = [], []
@@ -704,6 +717,13 @@ def fit_stage1():
           'weights=50% global / 50% clips; randomized train centers, fixed eval centers.', flush=True)
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
     split['official_test'] = held_out['path'].tolist() if len(held_out) else []
+    split_reference = os.getenv('S1_SPLIT_REFERENCE')
+    if split_reference:
+        reference = json.loads(Path(split_reference).read_text(encoding='utf-8'))
+        if reference['split'] != split:
+            raise ValueError('Split differs from S1_SPLIT_REFERENCE; keep original seed/data/val ratio')
+    print(f'effective_batch={videos * accumulation}; accumulation={accumulation}; '
+          f'ema_decay={ema_decay}; optimizer_steps_per_epoch={steps_per_epoch}', flush=True)
     # Relative names and byte sizes detect changed indexing without depending on mount location.
     manifest = []
     for row in pd.concat([train, val]).itertuples():
@@ -720,6 +740,9 @@ def fit_stage1():
                     sampling=sampling, aggregation=('mean_frame_softmax' if image_dataset else 'half_global_half_clips_softmax'),
                     schedule=dict(epochs=epochs, steps_per_epoch=steps_per_epoch,
                                   warmup_epochs=warmup_epochs, peak_lr=peak_lr, min_lr=min_lr))
+    if accumulation != 1 or ema is not None:
+        settings.update(accumulation=accumulation, ema_decay=ema_decay,
+                        training_version='accum_ema_v1', selection='ema' if ema is not None else 'raw')
     if resume:
         saved = torch.load(MODEL / 'last.pt', map_location='cpu', weights_only=False)
         previous_settings = dict(saved['settings'])
@@ -733,6 +756,8 @@ def fit_stage1():
             print(f'Resuming with precision change: {previous_precision} -> {precision}; '
                   'optimizer state is retained, FP16 scaler state is discarded.')
         model.load_state_dict(saved['model'])
+        if ema is not None:
+            ema.load_state_dict(saved['ema_model'], strict=True)
         optimizer.load_state_dict(saved['optimizer'])
         scaler.load_state_dict(saved['scaler'])
         history = saved['history']
@@ -755,13 +780,17 @@ def fit_stage1():
         lr_first = None
         gradient_norms = []
         for step, indices in enumerate(batches, 1):
-            absolute_step = (epoch - 1) * steps_per_epoch + step - 1
+            group_start = ((step - 1) // accumulation) * accumulation
+            group_end = min(group_start + accumulation, len(batches))
+            group_count = sum(len(batch) for batch in batches[group_start:group_end])
+            absolute_step = (epoch - 1) * steps_per_epoch + (step - 1) // accumulation
             lr = learning_rate_at(absolute_step, total_steps, warmup_steps, peak_lr, min_lr)
             for group in optimizer.param_groups:
                 group['lr'] = lr
             if lr_first is None:
                 lr_first = lr
-            optimizer.zero_grad(set_to_none=True)
+            if step - 1 == group_start:
+                optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.
             for part, labels, weights in mixed_frame_batches(train, indices, model.config['size'],
                                                              frames, frame_batch, rng, sampling):
@@ -771,29 +800,45 @@ def fit_stage1():
                     loss = (focal_loss(model(part), labels, reduction='none') * weights.to(device)).sum()
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f'Nonfinite training loss for indices {indices}')
-                scaler.scale(loss).backward()
+                scaler.scale(loss * len(indices) / group_count).backward()
                 batch_loss += float(loss.detach())
-            scaler.unscale_(optimizer)
-            gradient_norms.append(float(clip_training_gradients(
-                model, train.iloc[indices].path.tolist())))
-            scaler.step(optimizer)
-            scaler.update()
+            if step == group_end:
+                scaler.unscale_(optimizer)
+                gradient_norms.append(float(clip_training_gradients(
+                    model, train.iloc[indices].path.tolist())))
+                scaler.step(optimizer)
+                scaler.update()
+                if ema is not None:
+                    with torch.no_grad():
+                        for target, source in zip(ema.parameters(), model.parameters()):
+                            target.lerp_(source.detach(), 1 - ema_decay)
+                        for target, source in zip(ema.buffers(), model.buffers()):
+                            target.copy_(source)
             train_loss += batch_loss * len(indices)
             samples_seen += len(indices)
             if step == 1 or step % 25 == 0 or step == len(batches):
                 print(f'epoch={epoch}/{epochs} batch={step}/{len(batches)} '
                       f'train_focal={train_loss / samples_seen:.6f} lr={lr:.3g}', flush=True)
         # Always match submission precision, even if training uses BF16.
-        metrics = validate(model, val, device, frames, frame_batch, 'fp32', sampling)
+        raw_metrics = validate(model, val, device, frames, frame_batch, 'fp32', sampling)
+        metrics = (validate(ema, val, device, frames, frame_batch, 'fp32', sampling)
+                   if ema is not None else raw_metrics)
         record = dict(epoch=epoch, train_focal_loss=train_loss / samples_seen,
                       lr_start=lr_first, lr_end=lr,
                       gradient_norm_mean=float(np.mean(gradient_norms)),
                       gradient_norm_max=float(max(gradient_norms)), **metrics)
         history.append(record)
+        record['raw_metrics'] = raw_metrics
+        record['weight_source'] = 'ema' if ema is not None else 'raw'
+        if ema is not None:
+            record['ema_metrics'] = metrics
+        record['raw_recent_stability'] = recent_stability([r.get('raw_metrics', r) for r in history])
         stability = recent_stability(history)
         record['recent_stability'] = stability
         current_checkpoint = dict(architecture=model.architecture,
-                        model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                        model={k: v.detach().cpu().clone() for k, v in
+                               (ema if ema is not None else model).state_dict().items()},
+                        weight_source=record['weight_source'],
                         config=model.config, frames=16, size=model.config['size'],
                         sampling=HYBRID_SAMPLING, preprocessing='rgb_0_1_adaptive_pool',
                         training_dataset=os.getenv('S1_DATASET', 'videos'),
@@ -809,8 +854,16 @@ def fit_stage1():
             best_checkpoint = current_checkpoint
             atomic_torch_save(best_checkpoint, MODEL / 'best.pt')
         atomic_torch_save(current_checkpoint, MODEL / 'final.pt')
+        if ema is not None:
+            raw_checkpoint = dict(current_checkpoint, weight_source='raw', metrics=raw_metrics,
+                                  recent_stability=record['raw_recent_stability'],
+                                  model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+            atomic_torch_save(raw_checkpoint, MODEL / 'final_raw.pt')
+            print(f'raw_f1={raw_metrics["macro_f1"]:.4f}; ema_f1={metrics["macro_f1"]:.4f}; '
+                  'best.pt selection uses EMA', flush=True)
         atomic_torch_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                                scaler=scaler.state_dict(), epoch=epoch, settings=settings,
+                               ema_model=ema.state_dict() if ema is not None else None,
                                split=split, history=history, best_f1=best_f1, best_loss=best_loss,
                                best_epoch=best_epoch, best_checkpoint=best_checkpoint,
                                numpy_rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(),
