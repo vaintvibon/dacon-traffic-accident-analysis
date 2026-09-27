@@ -2,6 +2,17 @@
 
 Run: python -m train.stage1_train
 Optional env: EPOCHS, S1_VAL_RATIO, S1_SEED, S1_LR, S1_FRAME_BATCH.
+S1_FEATURES=multibranch requires S1_DATASET=videos and ffprobe on PATH.
+labels.csv: path,label,source_id; label is ORIGINAL/RERECORDED, and source_id
+must group an original with all its derivatives. S1_SAMPLE_FPS=1 or 2(default),
+S1_MAX_FRAMES=64 caps memory on long videos. S1_ENCODING=0 disables fusion of
+encoding features for ablation (ffprobe still supplies timestamp metadata).
+New multi-branch training uses feature_version=2: 25D luminance, 32D per
+branch. S1_BRANCHES=L/H/E/LH/LHE overrides S1_ENCODING; default is LHE.
+Train each ablation in a separate folder with the same source split.
+S1_MODE=diagnose_encoding evaluates the saved validation set before/after
+fixed H264/720p/30fps/CRF23 re-encoding, requires ffmpeg+ffprobe, writes only
+encoding_diagnostics.json, and never trains or overwrites input videos.
 ICL stability experiment: S1_ACCUM_STEPS=8 with S1_VIDEO_BATCH=4 gives
 32 images/update; S1_EMA_DECAY=0.99 averages weights after optimizer updates.
 Defaults remain accumulation=1/EMA disabled. EMA runs select best.pt and
@@ -43,6 +54,8 @@ import cv2
 import os
 import random
 import copy
+import subprocess
+import tempfile
 import sys
 
 import numpy as np
@@ -54,6 +67,7 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(ROOT))
 from models.stage1_model import Stage1CNNViT, focal_loss, load_stage1_video, sample_frame_ids
 from models.stage1_model import HYBRID_SAMPLING, LTC_ARCHITECTURE, frame_weights
+from models.stage1_model import Stage1MultiBranch, MULTIBRANCH_ARCHITECTURE
 
 DATA = ROOT / 'data' / 'stage1'
 MODEL = ROOT / 'model' / 'stage1'
@@ -300,10 +314,12 @@ def validate(model, df, device, frames=16, frame_batch=16, precision='fp32',
     for number, row in enumerate(df.itertuples(), 1):
         if number == 1 or number % 50 == 0:
             print(f'Evaluating {number}/{len(df)} videos', flush=True)
-        clip = load_row(row, model.config['size'], frames, sampling=sampling)
+        clip = (model.load_video(DATA / row.path) if isinstance(model, Stage1MultiBranch) else
+                load_row(row, model.config['size'], frames, sampling=sampling))
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=precision == 'bf16'):
-            probability = model.video_probability(clip[None].to(device), frame_batch, sampling)[0, 1]
+            probability = (model(clip).float().softmax(-1)[0, 1] if isinstance(model, Stage1MultiBranch) else
+                           model.video_probability(clip[None].to(device), frame_batch, sampling)[0, 1])
         labels.append(LABELS[row.label])
         probabilities.append(float(probability))
     return classification_metrics(labels, probabilities)
@@ -613,6 +629,63 @@ def diagnose_checkpoints(df, device):
     print(f'Report: {output}. Checkpoint hashes unchanged.', flush=True)
 
 
+@torch.inference_mode()
+def diagnose_encoding(df, device):
+    """Frozen-model, saved-validation-only sensitivity to common re-encoding.
+
+    Recomputes ALL features from each transcoded file; retains neither temporary
+    videos nor modified weights. This does not remove historical compression.
+    """
+    path = Path(os.getenv('S1_CHECKPOINT', str(MODEL / 'best.pt')))
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if checkpoint.get('architecture') != MULTIBRANCH_ARCHITECTURE:
+        raise ValueError('Controlled encoding test requires a multi-branch checkpoint')
+    model = Stage1MultiBranch(**checkpoint['config']).to(device).eval()
+    model.load_state_dict(checkpoint['model'], strict=True)
+    split = checkpoint['split']
+    if set(split['train']) & set(split['validation']):
+        raise ValueError('Overlapping saved split')
+    indexed = df.set_index('path', drop=False)
+    val, train = indexed.loc[split['validation']], indexed.loc[split['train']]
+    group = next((k for k in ('source_id', 'group_id') if k in df), None)
+    if not group or set(val[group]) & set(train[group]):
+        raise ValueError('Missing source groups or source overlap')
+    threshold = float(checkpoint['threshold'])
+    records = []
+    # Fixed, class-independent protocol. Letterbox preserves aspect ratio.
+    filters = 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30'
+    with tempfile.TemporaryDirectory(prefix='s1_controlled_') as temporary:
+        for number, row in enumerate(val.itertuples(index=False), 1):
+            source = DATA / row.path
+            output = Path(temporary) / 'controlled.mp4'
+            command = ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(source),
+                       '-map', '0:v:0', '-an', '-vf', filters, '-c:v', 'libx264',
+                       '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p',
+                       '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+                       '-map_metadata', '-1', str(output)]
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
+            with torch.autocast(device_type=device.type, enabled=False):
+                original_p = float(model(model.load_video(source)).softmax(-1)[0,1])
+                controlled_p = float(model(model.load_video(output)).softmax(-1)[0,1])
+            records.append(dict(path=row.path, label=LABELS[row.label],
+                                original=original_p, controlled=controlled_p))
+            print(f'Controlled encoding: {number}/{len(val)}', flush=True)
+    labels = [r['label'] for r in records]
+    metrics = {key: classification_metrics(labels, [r[key] for r in records], threshold)
+               for key in ('original', 'controlled')}
+    report = dict(checkpoint=str(path), config=model.config, threshold=threshold,
+                  protocol=dict(codec='libx264', preset='medium', crf=23, fps=30,
+                                resolution=[1280,720], gop=60, scene_cut=False, filters=filters),
+                  metrics=metrics, predictions=records,
+                  note='Sensitivity test; prior compression is not erased; geometry/FPS also change.')
+    destination = MODEL / 'encoding_diagnostics.json'
+    temporary_report = destination.with_suffix('.tmp')
+    temporary_report.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    os.replace(temporary_report, destination)
+    print(json.dumps(metrics, indent=2), flush=True)
+    print(f'Report: {destination}; no checkpoint weights written.', flush=True)
+
+
 def fit_stage1():
     global DATA, MODEL
     DATA = Path(os.getenv('S1_DATA_DIR', str(DATA))).expanduser().resolve()
@@ -646,6 +719,11 @@ def fit_stage1():
     else:
         raise ValueError('S1_DATASET must be videos, vdmoire or icl')
     mode = os.getenv('S1_MODE', 'train')
+    if mode == 'diagnose_encoding':
+        if os.getenv('S1_DATASET', 'videos') != 'videos':
+            raise ValueError('Controlled encoding diagnosis requires videos')
+        diagnose_encoding(df, device)
+        return
     if mode == 'diagnose_checkpoints':
         if not image_dataset:
             raise ValueError('diagnose_checkpoints currently requires S1_DATASET=icl')
@@ -674,9 +752,19 @@ def fit_stage1():
         raise ValueError('Output contains checkpoints: use S1_RESUME=1 or a new S1_MODEL_DIR.')
     cv2.setNumThreads(1)
     feature_mode = os.getenv('S1_FEATURES', 'cnn_ltc').lower()
-    if feature_mode not in ('cnn', 'cnn_ltc'):
-        raise ValueError('S1_FEATURES must be cnn or cnn_ltc')
-    model = Stage1CNNViT(norm='group', use_ltc=feature_mode == 'cnn_ltc').to(device)
+    if feature_mode not in ('cnn', 'cnn_ltc', 'multibranch'):
+        raise ValueError('S1_FEATURES must be cnn, cnn_ltc or multibranch')
+    multibranch = feature_mode == 'multibranch'
+    if multibranch and os.getenv('S1_DATASET', 'videos') != 'videos':
+        raise ValueError('Multi-branch requires actual videos and labels.csv; ICL/VDmoire frames are unsupported')
+    if multibranch and not any(c in df for c in ('source_id', 'group_id')):
+        raise ValueError('Multi-branch labels.csv requires source_id or group_id for derivative grouping')
+    model = (Stage1MultiBranch(sample_fps=int(os.getenv('S1_SAMPLE_FPS', '2')),
+                              max_frames=int(os.getenv('S1_MAX_FRAMES', '64')),
+                              feature_version=2,
+                              branches=os.getenv('S1_BRANCHES', 'LHE' if os.getenv('S1_ENCODING', '1') == '1' else 'LH').upper().replace('+', ''),
+                              encoding_enabled=os.getenv('S1_ENCODING', '1') == '1') if multibranch else
+             Stage1CNNViT(norm='group', use_ltc=feature_mode == 'cnn_ltc')).to(device)
     peak_lr = float(os.getenv('S1_LR', '0.00001'))
     min_lr = float(os.getenv('S1_MIN_LR', str(peak_lr * .1)))
     warmup_epochs = int(os.getenv('S1_WARMUP_EPOCHS', str(min(3, epochs - 1))))
@@ -709,10 +797,9 @@ def fit_stage1():
           f'validation={len(val)}; source groups split')
     print(f'norm=group; optimizer=AdamW; lr={peak_lr:g}->{min_lr:g}; '
           f'warmup={warmup_epochs} epochs; validation=fp32', flush=True)
-    print(f'features={feature_mode}; architecture={model.architecture}; '
-          f'input={model.config["size"]}x{model.config["size"]}; '
-          'LTC uses fixed per-frame statistics on resized RGB when enabled.', flush=True)
-    print('Sampling: one image per example, no repeated frames.' if image_dataset else
+    print(f'features={feature_mode}; architecture={model.architecture}; config={model.config}', flush=True)
+    print('Sampling: timestamp-based, native-resolution Haar patches and original-file metadata.' if multibranch else
+          'Sampling: one image per example, no repeated frames.' if image_dataset else
           'Sampling: global 16 + three continuous 16-frame clips; '
           'weights=50% global / 50% clips; randomized train centers, fixed eval centers.', flush=True)
     best_f1, best_loss, best_epoch = -1., float('inf'), 0
@@ -743,6 +830,9 @@ def fit_stage1():
     if accumulation != 1 or ema is not None:
         settings.update(accumulation=accumulation, ema_decay=ema_decay,
                         training_version='accum_ema_v1', selection='ema' if ema is not None else 'raw')
+    if multibranch:
+        settings.update(training_version='multibranch_train_v1', sampling='timestamp_fps_v1',
+                        aggregation='temporal_moments_mlp', frames=None)
     if resume:
         saved = torch.load(MODEL / 'last.pt', map_location='cpu', weights_only=False)
         previous_settings = dict(saved['settings'])
@@ -792,9 +882,15 @@ def fit_stage1():
             if step - 1 == group_start:
                 optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.
-            for part, labels, weights in mixed_frame_batches(train, indices, model.config['size'],
-                                                             frames, frame_batch, rng, sampling):
-                part, labels = part.to(device), labels.to(device)
+            if multibranch:
+                parts = ((model.load_video(DATA / train.iloc[int(i)].path),
+                          torch.tensor([LABELS[train.iloc[int(i)].label]]),
+                          torch.tensor([1 / len(indices)])) for i in indices)
+            else:
+                parts = mixed_frame_batches(train, indices, model.config['size'],
+                                            frames, frame_batch, rng, sampling)
+            for part, labels, weights in parts:
+                part, labels = (part if multibranch else part.to(device)), labels.to(device)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=precision == 'bf16'):
                     loss = (focal_loss(model(part), labels, reduction='none') * weights.to(device)).sum()
@@ -839,11 +935,12 @@ def fit_stage1():
                         model={k: v.detach().cpu().clone() for k, v in
                                (ema if ema is not None else model).state_dict().items()},
                         weight_source=record['weight_source'],
-                        config=model.config, frames=16, size=model.config['size'],
-                        sampling=HYBRID_SAMPLING, preprocessing='rgb_0_1_adaptive_pool',
+                        config=model.config, frames=None if multibranch else 16, size=model.config.get('size'),
+                        sampling='timestamp_fps_v1' if multibranch else HYBRID_SAMPLING,
+                        preprocessing='luma_haar_bitstream_v1' if multibranch else 'rgb_0_1_adaptive_pool',
                         training_dataset=os.getenv('S1_DATASET', 'videos'),
                         validation_unit='image' if image_dataset else 'video',
-                        aggregation='half_global_half_clips_softmax', threshold=threshold,
+                        aggregation='temporal_moments_mlp' if multibranch else 'half_global_half_clips_softmax', threshold=threshold,
                         evaluation_precision='fp32', epoch=epoch, metrics=metrics,
                         recent_stability=stability, seed=seed, split=split)
         improved = (metrics['macro_f1'] > best_f1 or

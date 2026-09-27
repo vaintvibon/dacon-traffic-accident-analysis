@@ -47,6 +47,27 @@ def predict_stage1(data_dir, model_dir):
 
     device = _device()
     checkpoint = torch.load(Path(model_dir) / "best.pt", map_location="cpu", weights_only=False)
+    from models.stage1_model import Stage1MultiBranch, MULTIBRANCH_ARCHITECTURE
+    if checkpoint.get('architecture') == MULTIBRANCH_ARCHITECTURE:
+        if (checkpoint.get('preprocessing') != 'luma_haar_bitstream_v1'
+                or checkpoint.get('sampling') != 'timestamp_fps_v1'
+                or checkpoint.get('aggregation') != 'temporal_moments_mlp'):
+            raise ValueError('Unsupported multi-branch preprocessing')
+        model = Stage1MultiBranch(**checkpoint['config']).to(device).eval()
+        model.load_state_dict(checkpoint['model'], strict=True)
+        threshold = float(checkpoint['threshold'])
+        if not 0 <= threshold <= 1:
+            raise ValueError('Invalid threshold')
+        rows = []
+        with torch.inference_mode(), torch.autocast(device_type='cuda', enabled=False):
+            for path in _video_paths(Path(data_dir) / 'videos'):
+                p = float(model(model.load_video(path)).softmax(-1)[0, 1])
+                if not np.isfinite(p):
+                    raise ValueError(f'Nonfinite prediction: {path.name}')
+                rows.append({'ID': path.stem, 'answer': 'RERECORDED' if p >= threshold else 'ORIGINAL'})
+        del model
+        torch.cuda.empty_cache()
+        return pd.DataFrame(rows, columns=['ID', 'answer'])
     if checkpoint.get("architecture") not in ("cnn_vit_frame_v1", LTC_ARCHITECTURE):
         raise ValueError("Stage 1 requires a newly trained CNN-ViT best.pt (old MViT weights are incompatible).")
     sampling = checkpoint.get("sampling")

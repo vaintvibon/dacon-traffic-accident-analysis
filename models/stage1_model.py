@@ -11,11 +11,176 @@ before spatial attention. This is a two-paper extension, not an exact replica.
 import cv2
 import numpy as np
 import torch
+import json
+import subprocess
 from torch import nn
 from torch.nn import functional as F
 
 
 HYBRID_SAMPLING = 'global_plus_three_clips_v1'
+MULTIBRANCH_ARCHITECTURE = 'multibranch_forensic_v1'
+
+
+def load_forensic_video(path, sample_fps=2, max_frames=64, patch_size=128, feature_version=1):
+    """Original-file statistics; timestamp sampling; native-resolution Haar patches.
+
+    Packet sizes are deliberately NOT called frame sizes: no 1:1 assumption.
+    Fail on absent metadata rather than substituting a class-correlated zero.
+    Caps sampled frames uniformly for long videos; no encoded video is written.
+    """
+    if (sample_fps not in (1, 2) or max_frames < 1 or patch_size < 16 or patch_size % 2
+            or feature_version not in (1, 2)):
+        raise ValueError('Invalid forensic sampling/patch configuration')
+    command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+               '-show_streams', '-show_packets', '-show_frames', '-show_entries',
+               'stream=width,height:packet=size,duration_time:frame=pict_type,best_effort_timestamp_time',
+               '-of', 'json', str(path)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+    except FileNotFoundError as error:
+        raise RuntimeError('Multi-branch video loading requires ffprobe on PATH') from error
+    metadata = json.loads(result.stdout)
+    stream = metadata['streams'][0]
+    combined = metadata.get('packets_and_frames', [])
+    packets = metadata.get('packets', [r for r in combined if r.get('type') == 'packet'])
+    frames = metadata.get('frames', [r for r in combined if r.get('type') == 'frame'])
+    times = np.array([float(f['best_effort_timestamp_time']) for f in frames])
+    sizes = np.array([float(p['size']) for p in packets])
+    if len(times) < 1 or not len(sizes) or not np.isfinite(times).all() or not np.isfinite(sizes).all():
+        raise ValueError(f'Incomplete/nonfinite video metadata: {path}')
+    if np.any(np.diff(times) < 0):
+        raise ValueError('Nonmonotonic presentation timestamps')
+    duration = times[-1] - times[0] + (np.median(np.diff(times)) if len(times) > 1 else
+                                     float(packets[-1].get('duration_time', 0)))
+    if duration <= 0:
+        raise ValueError('Cannot determine positive video duration')
+    width, height = int(stream['width']), int(stream['height'])
+    types = [f.get('pict_type', '') for f in frames]
+    if any(t not in ('I', 'P', 'B') for t in types):
+        raise ValueError('Missing/unsupported I/P/B picture types')
+    # 12 features: log bitrate, log bpppf, log packet-size distribution,
+    # packet-size CV, I/P/B fractions, log effective FPS.
+    encoding = np.array([np.log1p(8 * sizes.sum() / duration),
+                         np.log1p(8 * sizes.sum() / (width * height * len(frames))),
+                         *np.log1p([sizes.mean(), sizes.std(), *np.quantile(sizes, [.1, .5, .9])]),
+                         sizes.std() / max(sizes.mean(), 1),
+                         *[types.count(t) / len(types) for t in ('I', 'P', 'B')],
+                         np.log1p(len(frames) / duration)], dtype=np.float32)
+    targets = np.arange(times[0], times[-1] + 1e-8, 1 / sample_fps)
+    ids = np.unique(np.minimum(np.searchsorted(times, targets), len(times) - 1))
+    if len(ids) > max_frames:
+        ids = ids[np.linspace(0, len(ids) - 1, max_frames).round().astype(int)]
+    wanted, luminance, detail = set(ids.tolist()), [], []
+    cap = cv2.VideoCapture(str(path))
+    try:
+        for index in range(int(ids[-1]) + 1):
+            ok, bgr = cap.read()
+            if not ok:
+                raise ValueError(f'Incomplete decode: {path}')
+            if index not in wanted:
+                continue
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+            y = rgb @ np.array([.299, .587, .114], dtype=np.float32)
+            gy, gx = np.gradient(y)
+            g = np.hypot(gx, gy)
+            hist = np.histogram(y, bins=16, range=(0, 1))[0] / y.size
+            values = [y.mean(), y.std(), *np.quantile(y, [.1, .5, .9]), *hist, g.mean(), g.std()]
+            if feature_version == 2:
+                # Central half in each dimension; calculate BEFORE padding.
+                h, w = y.shape
+                center_mean = y[h//4:h-h//4, w//4:w-w//4].mean()
+                values.extend([center_mean / max(float(y.mean()), 1/255), center_mean - y.mean()])
+            luminance.append(np.array(values, dtype=np.float32))
+            # Reflect-pad small inputs; never shrink before extracting detail.
+            h, w = y.shape
+            y = np.pad(y, ((0, max(0, patch_size-h)), (0, max(0, patch_size-w))), mode='reflect')
+            h, w = y.shape
+            positions = [(0,0),(0,w-patch_size),(h-patch_size,0),
+                         (h-patch_size,w-patch_size),((h-patch_size)//2,(w-patch_size)//2)]
+            patches = []
+            for top, left in positions:
+                p = y[top:top+patch_size, left:left+patch_size]
+                a,b,c,d = p[::2,::2],p[::2,1::2],p[1::2,::2],p[1::2,1::2]
+                patches.append(np.stack([(a-b+c-d)/2, (a+b-c-d)/2, (a-b-c+d)/2]))
+            detail.append(np.stack(patches))
+    finally:
+        cap.release()
+    return dict(luminance=torch.from_numpy(np.stack(luminance)),
+                detail=torch.from_numpy(np.stack(detail)), encoding=torch.from_numpy(encoding))
+
+
+class Stage1MultiBranch(nn.Module):
+    """Per-video luminance/Haar/bitstream branches, temporal moments and MLP.
+
+    Input dictionaries represent ONE video (variable T). No batch/time padding.
+    Fixed feature units plus LayerNorm, not per-image brightness normalization.
+    Version 1 preserves legacy 64+64+32 checkpoints. Version 2 adds relative
+    luminance and projects each selected branch to 32D. branches selects
+    L/H/E/LH/LHE; preprocessing is shared, unused branches have no parameters.
+    """
+    def __init__(self, sample_fps=2, max_frames=64, patch_size=128, encoding_enabled=True,
+                 feature_version=1, branches=None):
+        super().__init__()
+        if sample_fps not in (1, 2) or max_frames < 1 or patch_size < 16 or patch_size % 2:
+            raise ValueError('Use 1/2 FPS, positive max_frames and even patch_size >=16')
+        self.config = dict(sample_fps=sample_fps, max_frames=max_frames,
+                           patch_size=patch_size, encoding_enabled=encoding_enabled)
+        if feature_version not in (1, 2):
+            raise ValueError('Unsupported multi-branch feature version')
+        self.feature_version = feature_version
+        self.branches = branches or ('LHE' if encoding_enabled else 'LH')
+        if self.branches not in ('L', 'H', 'E', 'LH', 'LHE'):
+            raise ValueError('branches must be L, H, E, LH or LHE')
+        if feature_version == 1 and branches is not None:
+            raise ValueError('Branch ablations require feature_version=2')
+        if feature_version == 2:
+            self.config.update(feature_version=2, branches=self.branches,
+                               encoding_enabled='E' in self.branches)
+        self.architecture = MULTIBRANCH_ARCHITECTURE
+        self.use_ltc = False
+        self.luminance = nn.Sequential(nn.Linear(25 if feature_version == 2 else 23, 32), nn.GELU(), nn.Linear(32,32))
+        self.high_frequency = nn.Sequential(nn.Conv2d(3,16,3,padding=1), nn.GroupNorm(4,16), nn.GELU(),
+                                           nn.Conv2d(16,32,3,stride=2,padding=1), nn.GroupNorm(8,32),
+                                           nn.GELU(), nn.AdaptiveAvgPool2d(1), nn.Flatten())
+        self.encoding = nn.Sequential(nn.LayerNorm(12), nn.Linear(12,32), nn.GELU()) if encoding_enabled else None
+        if feature_version == 2:
+            if 'L' not in self.branches:
+                self.luminance = None
+            if 'H' not in self.branches:
+                self.high_frequency = None
+            self.encoding = (nn.Sequential(nn.LayerNorm(12), nn.Linear(12,32), nn.GELU())
+                             if 'E' in self.branches else None)
+            for name in self.branches:
+                width = 32 if name == 'E' else 64
+                setattr(self, f'projection_{name}', nn.Sequential(nn.LayerNorm(width), nn.Linear(width,32), nn.GELU()))
+        fusion_dim = 32 * len(self.branches) if feature_version == 2 else 128 + (32 if encoding_enabled else 0)
+        self.head = nn.Sequential(nn.LayerNorm(fusion_dim),
+                                  nn.Linear(fusion_dim,64), nn.GELU(),
+                                  nn.Dropout(.1), nn.Linear(64,1))
+
+    def load_video(self, path):
+        return load_forensic_video(path, **{k:v for k,v in self.config.items() if k not in ('encoding_enabled', 'branches')})
+
+    def forward(self, video):
+        device = next(self.parameters()).device
+        pooled = []
+        if self.luminance is not None:
+            l = self.luminance(video['luminance'].to(device))
+            moments = torch.cat([l.mean(0), l.std(0, unbiased=False)])
+            pooled.append(self.projection_L(moments) if self.feature_version == 2 else moments)
+        if self.high_frequency is not None:
+            detail = video['detail'].to(device)
+            t, p, c, h, w = detail.shape
+            features = torch.cat([self.high_frequency(chunk) for chunk in
+                                  detail.reshape(t*p,c,h,w).split(32)]).reshape(t,p,32).mean(1)
+            moments = torch.cat([features.mean(0), features.std(0, unbiased=False)])
+            pooled.append(self.projection_H(moments) if self.feature_version == 2 else moments)
+        if self.encoding is not None:
+            e = self.encoding(video['encoding'].to(device))
+            pooled.append(self.projection_E(e) if self.feature_version == 2 else e)
+        logit = self.head(torch.cat(pooled))[None]
+        # softmax([0, logit]) == sigmoid(logit), compatible with existing loss.
+        return torch.cat((torch.zeros_like(logit), logit), -1)
 LTC_ARCHITECTURE = 'cnn_regional_ltc_vit_frame_v1'
 
 
